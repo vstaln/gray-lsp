@@ -1,0 +1,15 @@
+[package]
+name = "gray-lsp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "lsp plugin for the gray agent harness"
+license = "MIT"
+[lib]
+name = "lsp_plugin"
+path = "src/lib.rs"
+[[bin]]
+name = "lsp"
+path = "src/main.rs"
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
