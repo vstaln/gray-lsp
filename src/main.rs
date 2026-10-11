@@ -157,6 +157,7 @@ fn main() {
         Some("lsp") => args[1..].to_vec(), _ => args };
     match args.first().map(String::as_str) {
         Some("manifest") => println!("{}", manifest()),
+        Some("-h" | "--help" | "help") => println!("{}", status()),
         Some("sidecar") => { let _ = sidecar(); }
         Some("check") => {
             match lsp_check(&json!({})) { Ok(t) => println!("{t}"),
