@@ -37,43 +37,73 @@ fn have(b: &str) -> bool {
         .status().map(|s| s.success()).unwrap_or(false)
 }
 
-fn run_at(bin: &str, args: &[&str], dir: &Path) -> Result<String, String> {
+/// Runs `bin` and returns (merged output, exit success). stdout/stderr are
+/// drained on reader threads so a noisy child can't fill a pipe buffer and
+/// deadlock against our try_wait poll.
+fn run_at(bin: &str, args: &[&str], dir: &Path) -> Result<(String, bool), String> {
+    use std::io::Read;
     let mut child = Command::new(bin).args(args).current_dir(dir)
         .stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let t_out = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut f) = out_pipe.take() { let _ = f.read_to_string(&mut s); }
+        s
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut f) = err_pipe.take() { let _ = f.read_to_string(&mut s); }
+        s
+    });
     let t0 = Instant::now();
     loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            let o = child.wait_with_output().map_err(|e| e.to_string())?;
-            let mut s = String::from_utf8_lossy(&o.stdout).to_string();
-            let e = String::from_utf8_lossy(&o.stderr);
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            let mut s = t_out.join().unwrap_or_default();
+            let e = t_err.join().unwrap_or_default();
             if !e.trim().is_empty() { s.push('\n'); s.push_str(&e); }
-            return Ok(s);
+            return Ok((s, status.success()));
         }
         if t0.elapsed() > TIMEOUT {
             let _ = child.kill();
+            let _ = t_out.join();
+            let _ = t_err.join();
             return Err(format!("{bin} timed out at {}s", TIMEOUT.as_secs()));
         }
         std::thread::sleep(Duration::from_millis(120));
     }
 }
 
+/// label → (binary, args). Single source of truth for detect() and `tool:` pins.
+fn spec(label: &str) -> Option<(&'static str, &'static [&'static str])> {
+    Some(match label {
+        "cargo" => ("cargo", &["check", "--quiet", "--message-format", "short"][..]),
+        "clippy" => ("cargo", &["clippy", "--quiet", "--message-format", "short"][..]),
+        "tsc" => ("tsc", &["--noEmit", "--pretty", "false"][..]),
+        "pyright" => ("pyright", &["--outputjson"][..]),
+        "ruff" => ("ruff", &["check", "--output-format", "concise"][..]),
+        "govet" => ("go", &["vet", "./..."][..]),
+        _ => return None,
+    })
+}
+
 /// (marker file, [(binary, args, label) tried in order])
-fn detect(dir: &Path) -> Vec<(&'static str, &'static str, &'static [&'static str])> {
+fn detect(dir: &Path) -> Vec<&'static str> {
     let mut v = Vec::new();
     if dir.join("Cargo.toml").exists() {
-        v.push(("cargo", "cargo", &["check", "--quiet", "--message-format", "short"][..]));
+        v.push("cargo");
     }
     if dir.join("tsconfig.json").exists() || dir.join("package.json").exists() {
-        v.push(("tsc", "tsc", &["--noEmit", "--pretty", "false"][..]));
+        v.push("tsc");
     }
     if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists()
         || dir.join("requirements.txt").exists() {
-        v.push(("pyright", "pyright", &["--outputjson"][..]));
-        v.push(("ruff", "ruff", &["check", "--output-format", "concise"][..]));
+        v.push("pyright");
+        v.push("ruff");
     }
     if dir.join("go.mod").exists() {
-        v.push(("govet", "go", &["vet", "./..."][..]));
+        v.push("govet");
     }
     v
 }
