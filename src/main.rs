@@ -112,27 +112,44 @@ fn lsp_check(a: &Value) -> Result<String, String> {
     let dir = a["path"].as_str().map(Path::new).map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let pin = a["tool"].as_str().unwrap_or("auto");
-    let candidates = detect(&dir);
-    if candidates.is_empty() && pin == "auto" {
-        return Err(format!("no project markers in {}", dir.display()));
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", dir.display()));
     }
+    let candidates: Vec<String> = if pin == "auto" {
+        let d = detect(&dir);
+        if d.is_empty() {
+            return Err(format!("no project markers in {}", dir.display()));
+        }
+        d.iter().map(|s| s.to_string()).collect()
+    } else {
+        if spec(pin).is_none() {
+            return Err(format!(
+                "unknown tool '{pin}' — pick auto|cargo|clippy|tsc|pyright|ruff|govet"));
+        }
+        vec![pin.to_string()]
+    };
     let mut tried = Vec::new();
-    for (label, bin, args) in candidates {
-        if pin != "auto" && pin != label { continue; }
-        tried.push(label);
+    for label in &candidates {
+        let Some((bin, args)) = spec(label) else { continue };
+        tried.push(label.as_str());
         if !have(bin) { continue; }
-        let out = run_at(bin, args, &dir)?;
+        let (out, ok) = run_at(bin, args, &dir)?;
         let lines: Vec<&str> = out.lines()
             .filter(|l| l.contains(": error") || l.contains(": warning")
                 || l.contains("error:") || l.contains("warning:"))
             .collect();
-        let summary = if lines.is_empty() {
-            format!("{label}: clean ({})", out.lines().next().unwrap_or("no output"))
-        } else {
-            format!("{label}: {} findings\n{}", lines.len(),
-                lines.iter().take(80).cloned().collect::<Vec<_>>().join("\n"))
-        };
-        return Ok(summary);
+        if !lines.is_empty() {
+            return Ok(format!("{label}: {} findings\n{}", lines.len(),
+                lines.iter().take(80).cloned().collect::<Vec<_>>().join("\n")));
+        }
+        if !ok {
+            let tail: Vec<&str> = out.lines().collect();
+            let start = tail.len().saturating_sub(10);
+            return Err(format!(
+                "{label} exited non-zero with no parseable diagnostics:\n{}",
+                tail[start..].join("\n")));
+        }
+        return Ok(format!("{label}: clean ({})", out.lines().next().unwrap_or("no output")));
     }
     Err(format!("no usable checker for {} (tried: {})",
         dir.display(), tried.join(", ")))
