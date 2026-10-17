@@ -5,7 +5,7 @@
 //! → first available checker binary.
 
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use serde_json::{json, Value};
@@ -109,9 +109,12 @@ fn detect(dir: &Path) -> Vec<&'static str> {
 }
 
 /// (text, findings?): the CLI `check` verb exits non-zero on findings.
-fn lsp_check(a: &Value) -> Result<(String, bool), String> {
-    let dir = a["path"].as_str().map(Path::new).map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+fn lsp_check(a: &Value, session_cwd: &Path) -> Result<(String, bool), String> {
+    let dir = match a["path"].as_str() {
+        Some(p) if Path::new(p).is_absolute() => PathBuf::from(p),
+        Some(p) => session_cwd.join(p),
+        None => session_cwd.to_path_buf(),
+    };
     let pin = a["tool"].as_str().unwrap_or("auto");
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
@@ -177,8 +180,12 @@ fn sidecar() -> std::io::Result<()> {
                 let reply = if method == "plugin/manifest" {
                     json!({"id": id, "result": manifest()})
                 } else if method == "tool/call" {
+                    let scwd = v["params"]["session"]["cwd"].as_str()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| std::env::current_dir().ok())
+                        .unwrap_or_else(|| PathBuf::from("."));
                     let r = match v["params"]["name"].as_str().unwrap_or("") {
-                        "lsp_check" => match lsp_check(&v["params"]["args"]) {
+                        "lsp_check" => match lsp_check(&v["params"]["args"], &scwd) {
                             Ok((c, _)) => json!({"result": {"content": c}}),
                             Err(e) => json!({"result": {"content": e, "is_error": true}}),
                         },
@@ -208,7 +215,8 @@ fn main() {
         Some("-h" | "--help" | "help") => println!("{}", status()),
         Some("sidecar") => { let _ = sidecar(); }
         Some("check") => {
-            match lsp_check(&json!({})) {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match lsp_check(&json!({}), &cwd) {
                 Ok((t, found)) => { println!("{t}"); if found { std::process::exit(1); } }
                 Err(e) => { eprintln!("{e}"); std::process::exit(1); }
             }
