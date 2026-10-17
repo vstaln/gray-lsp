@@ -108,7 +108,8 @@ fn detect(dir: &Path) -> Vec<&'static str> {
     v
 }
 
-fn lsp_check(a: &Value) -> Result<String, String> {
+/// (text, findings?): the CLI `check` verb exits non-zero on findings.
+fn lsp_check(a: &Value) -> Result<(String, bool), String> {
     let dir = a["path"].as_str().map(Path::new).map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let pin = a["tool"].as_str().unwrap_or("auto");
@@ -139,8 +140,8 @@ fn lsp_check(a: &Value) -> Result<String, String> {
                 || l.contains("error:") || l.contains("warning:"))
             .collect();
         if !lines.is_empty() {
-            return Ok(format!("{label}: {} findings\n{}", lines.len(),
-                lines.iter().take(80).cloned().collect::<Vec<_>>().join("\n")));
+            return Ok((format!("{label}: {} findings\n{}", lines.len(),
+                lines.iter().take(80).cloned().collect::<Vec<_>>().join("\n")), true));
         }
         if !ok {
             let tail: Vec<&str> = out.lines().collect();
@@ -149,7 +150,7 @@ fn lsp_check(a: &Value) -> Result<String, String> {
                 "{label} exited non-zero with no parseable diagnostics:\n{}",
                 tail[start..].join("\n")));
         }
-        return Ok(format!("{label}: clean ({})", out.lines().next().unwrap_or("no output")));
+        return Ok((format!("{label}: clean ({})", out.lines().next().unwrap_or("no output")), false));
     }
     Err(format!("no usable checker for {} (tried: {})",
         dir.display(), tried.join(", ")))
@@ -178,7 +179,7 @@ fn sidecar() -> std::io::Result<()> {
                 } else if method == "tool/call" {
                     let r = match v["params"]["name"].as_str().unwrap_or("") {
                         "lsp_check" => match lsp_check(&v["params"]["args"]) {
-                            Ok(c) => json!({"result": {"content": c}}),
+                            Ok((c, _)) => json!({"result": {"content": c}}),
                             Err(e) => json!({"result": {"content": e, "is_error": true}}),
                         },
                         t => json!({"result": {"content": format!("unknown tool {t}"),
@@ -207,8 +208,10 @@ fn main() {
         Some("-h" | "--help" | "help") => println!("{}", status()),
         Some("sidecar") => { let _ = sidecar(); }
         Some("check") => {
-            match lsp_check(&json!({})) { Ok(t) => println!("{t}"),
-                Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
+            match lsp_check(&json!({})) {
+                Ok((t, found)) => { println!("{t}"); if found { std::process::exit(1); } }
+                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            }
         }
         _ => {
             if args.is_empty() {
