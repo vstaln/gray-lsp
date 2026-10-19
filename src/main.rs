@@ -4,11 +4,11 @@
 //! Detection order: marker files (Cargo.toml/tsconfig/pyproject/go.mod)
 //! → first available checker binary.
 
+use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use serde_json::{json, Value};
 
 const NAME: &str = "lsp";
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -32,22 +32,42 @@ fn manifest() -> Value {
 }
 
 fn have(b: &str) -> bool {
-    Command::new("sh").args(["-c", &format!("command -v {b}")])
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false)
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let dirs: Vec<_> = std::env::split_paths(&paths).collect();
+    if dirs.iter().any(|d| d.join(b).is_file()) {
+        return true;
+    }
+    // Windows resolves `name.<ext>` via PATHEXT (.COM;.EXE;.BAT;.CMD;...).
+    if cfg!(windows) {
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        return pathext
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .any(|ext| dirs.iter().any(|d| d.join(format!("{b}{ext}")).is_file()));
+    }
+    false
 }
 
 fn run_at(bin: &str, args: &[&str], dir: &Path) -> Result<String, String> {
-    let mut child = Command::new(bin).args(args).current_dir(dir)
-        .stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
+    let mut child = Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {bin}: {e}"))?;
     let t0 = Instant::now();
     loop {
         if child.try_wait().map_err(|e| e.to_string())?.is_some() {
             let o = child.wait_with_output().map_err(|e| e.to_string())?;
             let mut s = String::from_utf8_lossy(&o.stdout).to_string();
             let e = String::from_utf8_lossy(&o.stderr);
-            if !e.trim().is_empty() { s.push('\n'); s.push_str(&e); }
+            if !e.trim().is_empty() {
+                s.push('\n');
+                s.push_str(&e);
+            }
             return Ok(s);
         }
         if t0.elapsed() > TIMEOUT {
@@ -62,13 +82,19 @@ fn run_at(bin: &str, args: &[&str], dir: &Path) -> Result<String, String> {
 fn detect(dir: &Path) -> Vec<(&'static str, &'static str, &'static [&'static str])> {
     let mut v = Vec::new();
     if dir.join("Cargo.toml").exists() {
-        v.push(("cargo", "cargo", &["check", "--quiet", "--message-format", "short"][..]));
+        v.push((
+            "cargo",
+            "cargo",
+            &["check", "--quiet", "--message-format", "short"][..],
+        ));
     }
     if dir.join("tsconfig.json").exists() || dir.join("package.json").exists() {
         v.push(("tsc", "tsc", &["--noEmit", "--pretty", "false"][..]));
     }
-    if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists()
-        || dir.join("requirements.txt").exists() {
+    if dir.join("pyproject.toml").exists()
+        || dir.join("setup.py").exists()
+        || dir.join("requirements.txt").exists()
+    {
         v.push(("pyright", "pyright", &["--outputjson"][..]));
         v.push(("ruff", "ruff", &["check", "--output-format", "concise"][..]));
     }
@@ -79,7 +105,10 @@ fn detect(dir: &Path) -> Vec<(&'static str, &'static str, &'static [&'static str
 }
 
 fn lsp_check(a: &Value) -> Result<String, String> {
-    let dir = a["path"].as_str().map(Path::new).map(|p| p.to_path_buf())
+    let dir = a["path"]
+        .as_str()
+        .map(Path::new)
+        .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let pin = a["tool"].as_str().unwrap_or("auto");
     let candidates = detect(&dir);
@@ -88,31 +117,66 @@ fn lsp_check(a: &Value) -> Result<String, String> {
     }
     let mut tried = Vec::new();
     for (label, bin, args) in candidates {
-        if pin != "auto" && pin != label { continue; }
+        if pin != "auto" && pin != label {
+            continue;
+        }
         tried.push(label);
-        if !have(bin) { continue; }
+        if !have(bin) {
+            continue;
+        }
         let out = run_at(bin, args, &dir)?;
-        let lines: Vec<&str> = out.lines()
-            .filter(|l| l.contains(": error") || l.contains(": warning")
-                || l.contains("error:") || l.contains("warning:"))
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| {
+                l.contains(": error")
+                    || l.contains(": warning")
+                    || l.contains("error:")
+                    || l.contains("warning:")
+            })
             .collect();
         let summary = if lines.is_empty() {
-            format!("{label}: clean ({})", out.lines().next().unwrap_or("no output"))
+            format!(
+                "{label}: clean ({})",
+                out.lines().next().unwrap_or("no output")
+            )
         } else {
-            format!("{label}: {} findings\n{}", lines.len(),
-                lines.iter().take(80).cloned().collect::<Vec<_>>().join("\n"))
+            format!(
+                "{label}: {} findings\n{}",
+                lines.len(),
+                lines
+                    .iter()
+                    .take(80)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         };
         return Ok(summary);
     }
-    Err(format!("no usable checker for {} (tried: {})",
-        dir.display(), tried.join(", ")))
+    Err(format!(
+        "no usable checker for {} (tried: {})",
+        dir.display(),
+        tried.join(", ")
+    ))
 }
 
 fn status() -> String {
-    format!("lsp\n  checkers available: {}",
-        [("cargo",have("cargo")), ("tsc",have("tsc")), ("pyright",have("pyright")),
-         ("ruff",have("ruff")), ("go",have("go")), ("clippy",have("cargo-clippy"))]
-        .iter().filter(|(_,a)| *a).map(|(n,_)| *n).collect::<Vec<_>>().join(", "))
+    format!(
+        "lsp\n  checkers available: {}",
+        [
+            ("cargo", have("cargo")),
+            ("tsc", have("tsc")),
+            ("pyright", have("pyright")),
+            ("ruff", have("ruff")),
+            ("go", have("go")),
+            ("clippy", have("cargo-clippy"))
+        ]
+        .iter()
+        .filter(|(_, a)| *a)
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(", ")
+    )
 }
 
 fn sidecar() -> std::io::Result<()> {
@@ -120,7 +184,9 @@ fn sidecar() -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let line = line?;
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let method = v["method"].as_str().unwrap_or("");
         match v.get("id").cloned() {
             None if method == "plugin/shutdown" => return Ok(()),
@@ -137,14 +203,17 @@ fn sidecar() -> std::io::Result<()> {
                         t => json!({"result": {"content": format!("unknown tool {t}"),
                                     "is_error": true}}),
                     };
-                    let mut r = r; r["id"] = id; r
+                    let mut r = r;
+                    r["id"] = id;
+                    r
                 } else if method == "command/run" {
                     json!({"id": id, "result": {"text": status()}})
                 } else {
                     json!({"id": id, "error": {"code": -32601,
                         "message": format!("method not found: {method}")}})
                 };
-                writeln!(out, "{reply}")?; out.flush()?;
+                writeln!(out, "{reply}")?;
+                out.flush()?;
             }
         }
     }
@@ -154,23 +223,33 @@ fn sidecar() -> std::io::Result<()> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<String> = match args.first().map(String::as_str) {
-        Some("lsp") => args[1..].to_vec(), _ => args };
+        Some("lsp") => args[1..].to_vec(),
+        _ => args,
+    };
     match args.first().map(String::as_str) {
         Some("manifest") => println!("{}", manifest()),
         Some("-h" | "--help" | "help") => println!("{}", status()),
-        Some("sidecar") => { let _ = sidecar(); }
-        Some("check") => {
-            match lsp_check(&json!({})) { Ok(t) => println!("{t}"),
-                Err(e) => { eprintln!("{e}"); std::process::exit(1); } }
+        Some("sidecar") => {
+            let _ = sidecar();
         }
+        Some("check") => match lsp_check(&json!({})) {
+            Ok(t) => println!("{t}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
         _ => {
             if args.is_empty() {
                 if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-                    println!("{}", status()); return;
+                    println!("{}", status());
+                    return;
                 }
-                let _ = sidecar(); return;
+                let _ = sidecar();
+                return;
             }
-            eprintln!("unknown verb"); std::process::exit(1);
+            eprintln!("unknown verb");
+            std::process::exit(1);
         }
     }
 }
