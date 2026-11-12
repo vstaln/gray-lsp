@@ -18,7 +18,7 @@ fn manifest() -> Value {
         "name": NAME, "display_name": "LSP",
         "version": env!("CARGO_PKG_VERSION"), "protocol": "1.1",
         "tools": [
-            {"name": "lsp_check",
+            {"name": "lsp_check", "label": "Checked", "preview": "{path} · {tool}",
              "description": "Run the project's type/diagnostic checker (cargo check | tsc --noEmit | pyright | ruff check | go vet) and return file:line:col findings. Auto-detects from marker files; `tool` pins a checker.",
              "parameters": {"type": "object", "properties": {
                 "path": {"type": "string", "description": "project dir (default cwd)"},
