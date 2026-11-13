@@ -28,6 +28,7 @@ fn manifest() -> Value {
              }},
         ],
         "commands": ["/lsp"], "subcommands": ["lsp"],
+        "command_descriptions": {"/lsp": "type-check the project and show diagnostics"},
     })
 }
 
