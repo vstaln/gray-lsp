@@ -27,6 +27,7 @@ fn manifest() -> Value {
                     "description": "auto (default) picks from marker files"}},
              }},
         ],
+        "description": "type-check the project and show diagnostics",
         "commands": ["/lsp"], "subcommands": ["lsp"],
         "command_descriptions": {"/lsp": "type-check the project and show diagnostics"},
     })
